@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import re
 from collections import Counter, defaultdict
 
@@ -91,13 +92,14 @@ def summarize_most_searched(
         similarities = cosine_similarity(member_embeddings, center).reshape(-1)
         representative_idx = members[int(similarities.argmax())]
         representative = topics[representative_idx]
-        sample_indices = members[:3]
-        examples = [topics[idx] for idx in sample_indices]
+        member_titles = [topics[idx] for idx in members]
+        examples = member_titles[:3]
         cluster_summaries.append(
             {
                 "label": representative,
                 "size": len(members),
                 "examples": examples,
+                "sample_titles": member_titles,
             }
         )
 
@@ -112,12 +114,8 @@ def build_embeddings(topics: list[str], model_name: str):
     return model.encode(topics, normalize_embeddings=True)
 
 
-def pick_cluster_count(n_topics: int) -> int:
-    return max(2, min(100, n_topics))
-
-
 def cluster_topics(embeddings, topics: list[str], seed: int):
-    n_clusters = pick_cluster_count(len(topics))
+    n_clusters = min(100, len(topics))
     kmeans = KMeans(n_clusters=n_clusters, random_state=seed, n_init=10)
     labels = kmeans.fit_predict(embeddings)
     centers = kmeans.cluster_centers_
@@ -159,10 +157,51 @@ def most_distant_outliers(embeddings, topics: list[str], labels, centers, limit:
     return distances[:limit]
 
 
+def get_openai_client():
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        load_dotenv = None
+
+    if load_dotenv:
+        load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return None
+    return OpenAI(api_key=api_key)
+
+
+def label_with_llm(client, titles: list[str], fallback: str) -> str:
+    if not client:
+        return fallback
+
+    prompt = (
+        "Summarize the shared topic of these procurement study titles with a short "
+        "label (2-6 words). Use plain English, no quotes or special characters.\n\nTitles:\n"
+        + "\n".join(f"- {title}" for title in titles)
+    )
+    response = client.responses.create(
+        model="gpt-4o-mini",
+        input=[
+            {
+                "role": "system",
+                "content": "You create short, clear topic labels.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+    )
+    label = response.output_text.strip()
+    return label or fallback
+
+
 def main() -> None:
     file_path = "company_studies.jsonl"
     year = "2025"
-    top_n = 10
+    top_n = 30
     model_name = "all-MiniLM-L6-v2"
     seed = 42
 
@@ -185,6 +224,13 @@ def main() -> None:
     most_searched = summarize_most_searched(
         topics, labels, embeddings, centers, top_n
     )
+    client = get_openai_client()
+    if not client:
+        print("OpenAI not configured; using representative titles as labels.")
+    for cluster in most_searched:
+        cluster["label"] = label_with_llm(
+            client, cluster["sample_titles"], cluster["label"]
+        )
     print("\nMost searched topics (largest semantic clusters):")
     for rank, cluster in enumerate(most_searched, start=1):
         print(
